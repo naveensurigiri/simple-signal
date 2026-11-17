@@ -7,19 +7,23 @@ import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
+import android.os.Build
+import android.telephony.CellIdentityNr
+import android.telephony.CellInfoLte
+import android.telephony.CellInfoNr
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.net.HttpURLConnection
-import java.net.URL
 
 data class SimReading(
     val slot: Int,
     val carrier: String,
     val isData: Boolean,
-    val dbm: Int?
+    val dbm: Int?,
+    val band: String?,
+    val tech: String?
 )
 
 data class NetReading(
@@ -29,9 +33,11 @@ data class NetReading(
     val dataCarrier: String?,
     val dataTech: String?,
     val dataDbm: Int?,
+    val dataBand: String?,
     val wifiName: String?,
     val wifiRssi: Int?,
-    val wifiMbps: Int?
+    val wifiMbps: Int?,
+    val wifiBand: String?
 )
 
 object NetworkReader {
@@ -40,8 +46,10 @@ object NetworkReader {
         ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) ==
             PackageManager.PERMISSION_GRANTED
 
+    suspend fun read(context: Context): NetReading = withContext(Dispatchers.IO) { readNow(context) }
+
     @SuppressLint("MissingPermission")
-    fun read(context: Context): NetReading {
+    private fun readNow(context: Context): NetReading {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
         val onWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
@@ -51,6 +59,7 @@ object NetworkReader {
         var dataCarrier: String? = null
         var dataTech: String? = null
         var dataDbm: Int? = null
+        var dataBand: String? = null
 
         if (hasPhonePermission(context)) {
             val subManager =
@@ -61,14 +70,17 @@ object NetworkReader {
             for (info in subManager.activeSubscriptionInfoList.orEmpty()) {
                 val tm = baseTm.createForSubscriptionId(info.subscriptionId)
                 val dbm = readDbm(tm)
+                val band = readBand(tm)
+                val tech = techName(tm.dataNetworkType)
                 val isData = info.subscriptionId == defaultDataSub
                 val name = info.carrierName?.toString()?.takeIf { it.isNotBlank() }
                     ?: "SIM ${info.simSlotIndex + 1}"
-                sims += SimReading(info.simSlotIndex + 1, name, isData, dbm)
+                sims += SimReading(info.simSlotIndex + 1, name, isData, dbm, band, tech)
                 if (isData) {
                     dataCarrier = name
                     dataDbm = dbm
-                    dataTech = techName(tm.dataNetworkType)
+                    dataTech = tech
+                    dataBand = band
                 }
             }
         }
@@ -76,6 +88,7 @@ object NetworkReader {
         var wifiName: String? = null
         var wifiRssi: Int? = null
         var wifiMbps: Int? = null
+        var wifiBand: String? = null
         if (onWifi) {
             val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
             @Suppress("DEPRECATION")
@@ -83,6 +96,13 @@ object NetworkReader {
             wifiName = info?.ssid?.trim('"')?.takeIf { it.isNotBlank() && it != "<unknown ssid>" }
             wifiRssi = info?.rssi?.takeIf { it > -127 }
             wifiMbps = info?.linkSpeed?.takeIf { it > 0 }
+            val freq = info?.frequency ?: 0
+            wifiBand = when {
+                freq >= 5925 -> "6 GHz"
+                freq >= 4900 -> "5 GHz"
+                freq >= 2400 -> "2.4 GHz"
+                else -> null
+            }
         }
 
         return NetReading(
@@ -92,9 +112,11 @@ object NetworkReader {
             dataCarrier = dataCarrier,
             dataTech = dataTech,
             dataDbm = dataDbm,
+            dataBand = dataBand,
             wifiName = wifiName,
             wifiRssi = wifiRssi,
-            wifiMbps = wifiMbps
+            wifiMbps = wifiMbps,
+            wifiBand = wifiBand
         )
     }
 
@@ -103,6 +125,26 @@ object NetworkReader {
         tm.signalStrength?.cellSignalStrengths?.maxByOrNull { it.dbm }?.dbm
     } catch (e: SecurityException) {
         null
+    }
+
+    /** Band of the registered cell, for example B3 or n78. Needs Android 11 or newer. */
+    @SuppressLint("MissingPermission")
+    private fun readBand(tm: TelephonyManager): String? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        return try {
+            val cell = tm.allCellInfo?.firstOrNull { it.isRegistered } ?: return null
+            when (cell) {
+                is CellInfoLte -> cell.cellIdentity.bands
+                    .takeIf { it.isNotEmpty() }
+                    ?.joinToString(", ") { "B$it" }
+                is CellInfoNr -> (cell.cellIdentity as? CellIdentityNr)?.bands
+                    ?.takeIf { it.isNotEmpty() }
+                    ?.joinToString(", ") { "n$it" }
+                else -> null
+            }
+        } catch (e: SecurityException) {
+            null
+        }
     }
 
     private fun techName(type: Int): String = when (type) {
@@ -116,31 +158,5 @@ object NetworkReader {
         TelephonyManager.NETWORK_TYPE_GPRS,
         TelephonyManager.NETWORK_TYPE_GSM -> "2G"
         else -> "Mobile"
-    }
-
-    /** Downloads about 10 MB for up to 10 seconds and returns speed in Mbps, or null on failure. */
-    suspend fun downloadMbps(): Double? = withContext(Dispatchers.IO) {
-        try {
-            val conn = URL("https://speed.cloudflare.com/__down?bytes=10000000")
-                .openConnection() as HttpURLConnection
-            conn.connectTimeout = 8000
-            conn.readTimeout = 8000
-
-            val buffer = ByteArray(64 * 1024)
-            var total = 0L
-            val start = System.nanoTime()
-            conn.inputStream.use { input ->
-                while (true) {
-                    val read = input.read(buffer)
-                    if (read <= 0) break
-                    total += read
-                    if (System.nanoTime() - start > 10_000_000_000L) break
-                }
-            }
-            val seconds = (System.nanoTime() - start) / 1_000_000_000.0
-            if (total == 0L || seconds <= 0.0) null else (total * 8 / 1_000_000.0) / seconds
-        } catch (e: Exception) {
-            null
-        }
     }
 }
